@@ -2,6 +2,7 @@ package tracepath
 
 import (
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -253,26 +254,122 @@ func (s *Service) GetTrace(traceID string) (any, error) {
 	return trace, nil
 }
 
-// ListTraces summarises every stored trace with at least one span.
-func (s *Service) ListTraces(service string, limit int) (any, error) {
-	if limit < 1 || limit > 400 {
+// TraceFilter carries the validated GET /traces query parameters. A nil
+// pointer or an empty string means the parameter was not given, so the zero
+// value selects every trace.
+type TraceFilter struct {
+	Service       string
+	Query         string
+	Operation     string
+	Status        string
+	StartFrom     *time.Time
+	StartTo       *time.Time
+	MinDurationNS *int64
+	MaxDurationNS *int64
+	Complete      *bool
+	Valid         *bool
+	Limit         int
+}
+
+// matches reports whether one assembled trace survives every active filter.
+// All filters combine with logical AND. Time and duration bounds read the root
+// span, so a trace without a root cannot satisfy them.
+func (f TraceFilter) matches(trace *Trace) bool {
+	if f.Service != "" {
+		found := false
+		for _, node := range trace.Spans {
+			if node.Service == f.Service {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	if f.Query != "" {
+		needle := strings.ToLower(f.Query)
+		found := strings.Contains(strings.ToLower(trace.TraceID), needle)
+		for _, node := range trace.Spans {
+			if found {
+				break
+			}
+			found = strings.Contains(strings.ToLower(node.Service), needle) ||
+				strings.Contains(strings.ToLower(node.Operation), needle)
+		}
+		if !found {
+			return false
+		}
+	}
+	if f.Operation != "" {
+		found := false
+		for _, node := range trace.Spans {
+			if node.Operation == f.Operation {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	switch f.Status {
+	case "error":
+		if trace.ErrorSpans == 0 {
+			return false
+		}
+	case "ok":
+		if trace.ErrorSpans != 0 {
+			return false
+		}
+	}
+	if f.StartFrom != nil || f.StartTo != nil {
+		if trace.Root == nil {
+			return false
+		}
+		start, err := parseTime(trace.Root.StartTime, "start_time")
+		if err != nil {
+			return false
+		}
+		if f.StartFrom != nil && start.Before(*f.StartFrom) {
+			return false
+		}
+		if f.StartTo != nil && !start.Before(*f.StartTo) {
+			return false
+		}
+	}
+	if f.MinDurationNS != nil || f.MaxDurationNS != nil {
+		if trace.Root == nil {
+			return false
+		}
+		if f.MinDurationNS != nil && trace.Root.DurationNS < *f.MinDurationNS {
+			return false
+		}
+		if f.MaxDurationNS != nil && trace.Root.DurationNS > *f.MaxDurationNS {
+			return false
+		}
+	}
+	if f.Complete != nil && trace.Complete != *f.Complete {
+		return false
+	}
+	if f.Valid != nil && trace.Valid != *f.Valid {
+		return false
+	}
+	return true
+}
+
+// ListTraces summarises every stored trace with at least one span. Filtering
+// happens on the assembled traces, before the deterministic sort and the limit.
+func (s *Service) ListTraces(filter TraceFilter) (any, error) {
+	if filter.Limit < 1 || filter.Limit > 400 {
 		return nil, ValidationError("limit must be between 1 and 400")
 	}
 	value, err := s.store.View(func(state *State) (any, error) {
 		summaries := []*TraceSummary{}
 		for _, traceID := range state.traceIDs() {
 			trace := assembleTrace(traceID, state.Spans[traceID])
-			if service != "" {
-				found := false
-				for _, node := range trace.Spans {
-					if node.Service == service {
-						found = true
-						break
-					}
-				}
-				if !found {
-					continue
-				}
+			if !filter.matches(trace) {
+				continue
 			}
 			summary := &TraceSummary{
 				TraceID:      trace.TraceID,
@@ -301,8 +398,8 @@ func (s *Service) ListTraces(service string, limit int) (any, error) {
 			}
 			return summaries[i].TraceID < summaries[j].TraceID
 		})
-		if len(summaries) > limit {
-			summaries = summaries[:limit]
+		if len(summaries) > filter.Limit {
+			summaries = summaries[:filter.Limit]
 		}
 		return map[string]any{"traces": summaries}, nil
 	})

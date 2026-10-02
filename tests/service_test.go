@@ -954,6 +954,102 @@ func TestTraceListIsDeterministicAndFilterable(t *testing.T) {
 	}
 }
 
+// traceIDsOf extracts the trace ids of a GET /traces response in order.
+func traceIDsOf(t *testing.T, response map[string]any) []string {
+	t.Helper()
+	ids := []string{}
+	for _, item := range listOf(t, response["traces"]) {
+		id, _ := objectOf(t, item)["trace_id"].(string)
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func TestTraceListQueryFilters(t *testing.T) {
+	c := newClient(t)
+	c.loadFixture()
+	c.post(span("t-2", "r2", "", "billing", "charge", "server", "2024-06-01T00:00:02Z", 500, "ok", count(1)))
+	// t-3 declares two spans but only its root arrives, so it stays incomplete.
+	c.post(span("t-3", "r3", "", "search", "lookup", "server", "2024-06-01T00:00:01Z", 800, "ok", count(2)))
+
+	assert := func(path string, wanted ...string) {
+		t.Helper()
+		got := traceIDsOf(t, c.get(path))
+		if !reflect.DeepEqual(got, wanted) {
+			t.Fatalf("GET %s: got %v, want %v", path, got, wanted)
+		}
+	}
+
+	// q matches trace_id, service and operation, case-insensitively.
+	assert("/traces?q=T-1", "t-1")
+	assert("/traces?q=CHECKOUT", "t-1")
+	assert("/traces?q=Queue", "t-1")
+	assert("/traces?q=billing", "t-2")
+
+	// operation is an exact match on any span of the trace.
+	assert("/traces?operation=query", "t-1")
+	assert("/traces?operation=charge", "t-2")
+
+	// status keeps traces with an error span, or only fully ok traces.
+	assert("/traces?status=error", "t-1")
+	assert("/traces?status=ok", "t-2", "t-3")
+
+	// start_from is inclusive, start_to exclusive, both on the root start.
+	assert("/traces?start_from=2024-06-01T00:00:01Z", "t-2", "t-3")
+	assert("/traces?start_to=2024-06-01T00:00:01Z", "t-1")
+	assert("/traces?start_from=2024-06-01T00:00:00Z&start_to=2024-06-01T00:00:02Z", "t-3", "t-1")
+
+	// duration bounds include the root duration.
+	assert("/traces?min_duration_ns=800", "t-3", "t-1")
+	assert("/traces?max_duration_ns=500", "t-2")
+	assert("/traces?min_duration_ns=500&max_duration_ns=1000", "t-2", "t-3", "t-1")
+
+	// complete and valid filter the current reassembly result.
+	assert("/traces?complete=false", "t-3")
+	assert("/traces?valid=false", "t-3")
+	assert("/traces?complete=true&valid=true", "t-2", "t-1")
+
+	// filters combine with logical AND, also with the existing service filter.
+	assert("/traces?service=db&status=error", "t-1")
+	assert("/traces?q=query&complete=true", "t-1")
+	assert("/traces?operation=lookup&status=ok&max_duration_ns=800", "t-3")
+
+	// no hit is HTTP 200 with an empty array.
+	empty := c.get("/traces?q=no-such-thing")
+	if got := listOf(t, empty["traces"]); len(got) != 0 {
+		t.Fatalf("expected no traces, got %v", got)
+	}
+}
+
+func TestTraceListRejectsMalformedFilters(t *testing.T) {
+	c := newClient(t)
+	c.loadFixture()
+	bad := []string{
+		"/traces?start_from=not-a-time",
+		"/traces?start_to=2024-13-01T00:00:00Z",
+		"/traces?min_duration_ns=-5",
+		"/traces?min_duration_ns=1.5",
+		"/traces?max_duration_ns=abc",
+		"/traces?min_duration_ns=",
+		"/traces?min_duration_ns=10&max_duration_ns=5",
+		"/traces?complete=yes",
+		"/traces?valid=1",
+		"/traces?status=broken",
+		"/traces?status=",
+		"/traces?operation=",
+		"/traces?unknown=1",
+	}
+	for _, path := range bad {
+		status, _, decoded := c.do(request{method: http.MethodGet, path: path})
+		if status != http.StatusBadRequest {
+			t.Fatalf("GET %s: status %d, want 400", path, status)
+		}
+		if code := objectOf(t, decoded["error"])["code"]; code != "validation_error" {
+			t.Fatalf("GET %s: error code %v, want validation_error", path, code)
+		}
+	}
+}
+
 func TestTraceOutputIsByteStableAcrossReads(t *testing.T) {
 	c := newClient(t)
 	c.loadFixture()

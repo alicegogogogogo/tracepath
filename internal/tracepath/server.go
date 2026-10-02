@@ -48,18 +48,11 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 		return http.StatusCreated, response, err
 
 	case method == http.MethodGet && len(parts) == 1 && parts[0] == "traces":
-		if err := requireQuery(request, "service", "limit"); err != nil {
+		filter, err := parseTraceFilter(request)
+		if err != nil {
 			return 0, nil, err
 		}
-		limit := 100
-		if raw := request.URL.Query().Get("limit"); raw != "" {
-			parsed, err := strconv.Atoi(raw)
-			if err != nil {
-				return 0, nil, ValidationError("limit must be an integer")
-			}
-			limit = parsed
-		}
-		response, err := s.service.ListTraces(strings.TrimSpace(request.URL.Query().Get("service")), limit)
+		response, err := s.service.ListTraces(filter)
 		return http.StatusOK, response, err
 
 	case method == http.MethodGet && len(parts) == 2 && parts[0] == "traces":
@@ -84,6 +77,131 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 		return http.StatusOK, response, err
 	}
 	return 0, nil, NotFoundError("route was not found")
+}
+
+// traceFilterParams is the closed set of query parameters GET /traces accepts.
+var traceFilterParams = []string{
+	"service", "limit", "q", "operation", "status",
+	"start_from", "start_to", "min_duration_ns", "max_duration_ns",
+	"complete", "valid",
+}
+
+// parseTraceFilter decodes and validates every GET /traces query parameter.
+// A parameter that is present but malformed is a validation error; a parameter
+// that is absent simply leaves the filter field unset.
+func parseTraceFilter(request *http.Request) (TraceFilter, error) {
+	filter := TraceFilter{Limit: 100}
+	if err := requireQuery(request, traceFilterParams...); err != nil {
+		return filter, err
+	}
+	query := request.URL.Query()
+	filter.Service = strings.TrimSpace(query.Get("service"))
+	filter.Query = query.Get("q")
+	if raw := query.Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return filter, ValidationError("limit must be an integer")
+		}
+		filter.Limit = parsed
+	}
+	if _, present := query["operation"]; present {
+		operation := strings.TrimSpace(query.Get("operation"))
+		if operation == "" {
+			return filter, ValidationError("operation must not be empty")
+		}
+		filter.Operation = operation
+	}
+	if _, present := query["status"]; present {
+		status := query.Get("status")
+		if status != "ok" && status != "error" {
+			return filter, ValidationError("status must be ok or error")
+		}
+		filter.Status = status
+	}
+	if _, present := query["start_from"]; present {
+		instant, err := parseTime(query.Get("start_from"), "start_from")
+		if err != nil {
+			return filter, err
+		}
+		filter.StartFrom = &instant
+	}
+	if _, present := query["start_to"]; present {
+		instant, err := parseTime(query.Get("start_to"), "start_to")
+		if err != nil {
+			return filter, err
+		}
+		filter.StartTo = &instant
+	}
+	minimum, err := parseDurationBound(query, "min_duration_ns")
+	if err != nil {
+		return filter, err
+	}
+	filter.MinDurationNS = minimum
+	maximum, err := parseDurationBound(query, "max_duration_ns")
+	if err != nil {
+		return filter, err
+	}
+	filter.MaxDurationNS = maximum
+	if minimum != nil && maximum != nil && *minimum > *maximum {
+		return filter, ValidationError("min_duration_ns must not exceed max_duration_ns")
+	}
+	complete, err := parseBoolParam(query, "complete")
+	if err != nil {
+		return filter, err
+	}
+	filter.Complete = complete
+	valid, err := parseBoolParam(query, "valid")
+	if err != nil {
+		return filter, err
+	}
+	filter.Valid = valid
+	return filter, nil
+}
+
+// parseDurationBound decodes one duration bound: a decimal non-negative
+// integer of nanoseconds, nothing else.
+func parseDurationBound(query map[string][]string, name string) (*int64, error) {
+	if _, present := query[name]; !present {
+		return nil, nil
+	}
+	raw := ""
+	if values := query[name]; len(values) > 0 {
+		raw = values[0]
+	}
+	if raw == "" {
+		return nil, ValidationError("%s must be a non-negative decimal integer", name)
+	}
+	for _, digit := range raw {
+		if digit < '0' || digit > '9' {
+			return nil, ValidationError("%s must be a non-negative decimal integer", name)
+		}
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return nil, ValidationError("%s must be a non-negative decimal integer", name)
+	}
+	return &value, nil
+}
+
+// parseBoolParam decodes one boolean switch that accepts only the literal
+// strings true and false.
+func parseBoolParam(query map[string][]string, name string) (*bool, error) {
+	if _, present := query[name]; !present {
+		return nil, nil
+	}
+	raw := ""
+	if values := query[name]; len(values) > 0 {
+		raw = values[0]
+	}
+	switch raw {
+	case "true":
+		value := true
+		return &value, nil
+	case "false":
+		value := false
+		return &value, nil
+	}
+	return nil, ValidationError("%s must be true or false", name)
 }
 
 func readJSONBody(request *http.Request) ([]byte, error) {

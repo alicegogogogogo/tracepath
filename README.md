@@ -359,6 +359,9 @@ the sorted samples, which is deterministic and exact for small traces.
 ```http
 GET /traces
 GET /traces?service=db&limit=50
+GET /traces?q=checkout&status=error&complete=true
+GET /traces?start_from=2024-06-01T00:00:00Z&start_to=2024-06-02T00:00:00Z
+GET /traces?min_duration_ns=100&max_duration_ns=5000
 ```
 
 ```json
@@ -369,8 +372,25 @@ GET /traces?service=db&limit=50
 ```
 
 Traces are ordered by root start instant, newest first, then by trace id.
-`service` keeps only traces that contain that service, `limit` defaults to 100
-and must be between 1 and 400.
+`limit` defaults to 100 and must be between 1 and 400. Every other parameter
+filters the assembled traces and all filters combine with logical AND; a
+request without parameters lists everything and a filter without hits returns
+`200` with an empty `traces` array.
+
+| Parameter | Filter |
+| --- | --- |
+| `service` | keeps traces that contain the service |
+| `q` | Unicode case-insensitive substring of the trace id or of any span's service or operation |
+| `operation` | exact match on any span's operation; must not be empty |
+| `status` | `error` keeps traces with at least one error span, `ok` keeps traces whose spans are all ok |
+| `start_from` / `start_to` | root start time, `start_from` inclusive and `start_to` exclusive, RFC3339 with nanosecond precision |
+| `min_duration_ns` / `max_duration_ns` | root duration, both bounds inclusive, decimal non-negative integers |
+| `complete` / `valid` | literal `true` or `false`, matched against the current reassembly result |
+
+A malformed value — a non-RFC3339 timestamp, a non-integer or negative
+duration bound, `min_duration_ns` above `max_duration_ns`, a boolean that is
+not `true`/`false`, a `status` other than `ok`/`error`, an empty `operation`
+or an unknown parameter — is rejected with `400` and code `validation_error`.
 
 ## Error propagation
 
