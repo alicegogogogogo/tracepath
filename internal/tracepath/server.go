@@ -40,11 +40,19 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 		return http.StatusOK, map[string]any{"status": "ok"}, nil
 
 	case method == http.MethodPost && len(parts) == 1 && parts[0] == "spans":
-		body, err := readJSONBody(request)
+		body, err := readJSONBody(request, maxBodyBytes)
 		if err != nil {
 			return 0, nil, err
 		}
 		response, err := s.service.IngestSpan(body, request.Header.Get("Idempotency-Key"))
+		return http.StatusCreated, response, err
+
+	case method == http.MethodPost && len(parts) == 2 && parts[0] == "spans" && parts[1] == "batch":
+		body, err := readJSONBody(request, maxBatchBodyBytes)
+		if err != nil {
+			return 0, nil, err
+		}
+		response, err := s.service.IngestBatch(body, request.Header.Get("Idempotency-Key"))
 		return http.StatusCreated, response, err
 
 	case method == http.MethodGet && len(parts) == 1 && parts[0] == "traces":
@@ -92,18 +100,18 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 	return 0, nil, NotFoundError("route was not found")
 }
 
-func readJSONBody(request *http.Request) ([]byte, error) {
+func readJSONBody(request *http.Request, limit int64) ([]byte, error) {
 	contentType := request.Header.Get("Content-Type")
 	mediaType, _, _ := strings.Cut(contentType, ";")
 	if strings.TrimSpace(strings.ToLower(mediaType)) != "application/json" {
 		return nil, ValidationError("Content-Type must be application/json")
 	}
-	body, err := io.ReadAll(io.LimitReader(request.Body, maxBodyBytes+1))
+	body, err := io.ReadAll(io.LimitReader(request.Body, limit+1))
 	if err != nil {
 		return nil, ValidationError("request body could not be read")
 	}
-	if len(body) > maxBodyBytes {
-		return nil, ValidationError("request body must be at most %d bytes", maxBodyBytes)
+	if int64(len(body)) > limit {
+		return nil, ValidationError("request body must be at most %d bytes", limit)
 	}
 	return body, nil
 }

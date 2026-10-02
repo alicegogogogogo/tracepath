@@ -18,7 +18,9 @@ The release deliberately supports a compact public contract:
 - everything else is validated when the trace is reassembled, and reported as
   violations instead of guessed or silently dropped;
 - the sum of `self_time_ns` along the critical path is the root duration;
-- duplicate ingestion with the same `Idempotency-Key` returns the first result.
+- duplicate ingestion with the same `Idempotency-Key` returns the first result;
+- up to 1000 spans may arrive in one `POST /spans/batch` request, which commits
+  atomically and is idempotent as a whole.
 
 ## Requirements
 
@@ -229,6 +231,61 @@ Ingestion is refused with HTTP 409 when the span contradicts the stored spans:
 - its parent is in another trace;
 - a span with that id already exists in the trace;
 - its interval is not contained in a parent that is already stored.
+
+### Ingest a batch of spans
+
+```http
+POST /spans/batch
+Idempotency-Key: batch-1
+Content-Type: application/json
+
+{
+  "spans": [
+    {"trace_id": "t-1", "span_id": "s-root", "parent_id": null, "service": "gateway",
+     "operation": "GET /checkout", "kind": "server", "start_time": "2024-06-01T00:00:00Z",
+     "duration_ns": 1000, "status": "ok", "span_count": 6},
+    {"trace_id": "t-1", "span_id": "s-db", "parent_id": "s-root", "service": "db",
+     "operation": "select", "kind": "client", "start_time": "2024-06-01T00:00:00.000000350Z",
+     "duration_ns": 600, "status": "ok"}
+  ]
+}
+```
+
+The body is an object with a single field `spans` holding 1–1000 span documents;
+every element follows exactly the rules of `POST /spans`, and any other field,
+a non-object element, an empty array or more than 1000 spans is a
+`validation_error` (400). The batch is equivalent to posting the spans one by
+one in array order — they may mix traces, and a trace's root, children and
+siblings may share one batch — except that it commits atomically: the first
+element that fails validation or conflicts with the stored spans or with an
+earlier element of the batch fails the whole request, only that first problem
+is reported (400 `validation_error` or 409 `conflict`), no span of a failed
+batch is stored, and the `Idempotency-Key` is not consumed.
+
+A committed batch answers HTTP 201 with one entry per span, in request order;
+`complete`, `valid` and `violations` describe the span's trace as it stood
+right after that span was stored:
+
+```json
+{
+  "accepted": [
+    {"trace_id": "t-1", "span_id": "s-root", "accepted": true,
+     "complete": false, "valid": false,
+     "violations": [{"code": "trace_incomplete", "trace_id": "t-1", "span_id": "s-root",
+       "message": "trace t-1 declared span_count 6 but only 1 spans were ingested"}]},
+    {"trace_id": "t-1", "span_id": "s-db", "accepted": true,
+     "complete": false, "valid": false,
+     "violations": [{"code": "trace_incomplete", "trace_id": "t-1", "span_id": "s-root",
+       "message": "trace t-1 declared span_count 6 but only 2 spans were ingested"}]}
+  ],
+  "count": 2
+}
+```
+
+Replaying the request with the same `Idempotency-Key` and a byte-identical
+body returns the frozen first response without writing again; the same key
+with a different body, or a key another operation already used, is a
+`conflict` (409).
 
 ### Read a trace
 
