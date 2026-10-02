@@ -1,0 +1,5 @@
+/tracepath
+/tracepath.db
+/tracepath.db.tmp
+*.db
+*.db.tmp
