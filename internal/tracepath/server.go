@@ -55,6 +55,14 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 		response, err := s.service.IngestSpanBatch(body, request.Header.Get("Idempotency-Key"))
 		return http.StatusCreated, response, err
 
+	case method == http.MethodPost && len(parts) == 2 && parts[0] == "traces" && parts[1] == "retention":
+		body, err := readJSONBody(request)
+		if err != nil {
+			return 0, nil, err
+		}
+		response, err := s.service.ApplyRetention(body)
+		return http.StatusOK, response, err
+
 	case method == http.MethodGet && len(parts) == 1 && parts[0] == "traces":
 		if err := requireQuery(request, "service", "limit", "q", "operation", "status",
 			"start_from", "start_to", "min_duration_ns", "max_duration_ns", "complete", "valid",
