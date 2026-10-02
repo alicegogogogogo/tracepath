@@ -362,6 +362,7 @@ GET /traces?service=db&limit=50
 GET /traces?q=checkout&status=error&complete=true&valid=true
 GET /traces?operation=select&start_from=2024-06-01T00:00:00Z&start_to=2024-06-02T00:00:00Z
 GET /traces?min_duration_ns=500&max_duration_ns=2000
+GET /traces?service_path=gateway&service_path=db&service_path=cache
 ```
 
 ```json
@@ -390,6 +391,17 @@ summary fields and the ordering are unchanged; a query with no matches returns
 | `max_duration_ns` | keeps traces whose root duration is less than or equal to this many nanoseconds (inclusive) |
 | `complete` | `true` or `false`; filters on the current reassembly result |
 | `valid` | `true` or `false`; filters on the current reassembly result |
+| `service_path` | repeatable; keeps traces containing the named services as an ordered chain of direct parent/child spans |
+
+`service_path` may be repeated two to thirty-two times and the values form an
+ordered chain in the order they appear. A trace matches when it contains a span
+whose service is the first name, with a direct child whose service is the
+second name, and so on; the chain may start at any span, every hop must be a
+direct parent/child link, and non-adjacent names may repeat. Names are matched
+exactly as given, must be one to 128 characters each, and two adjacent names
+must differ. A trace that contains the chain more than once is still returned
+once. Fewer than two names, an empty name, a name longer than 128 characters,
+or two equal adjacent names answers HTTP 400 with code `validation_error`.
 
 `start_from` and `start_to` are compared at nanosecond precision. Duration
 bounds are decimal non-negative integers, and `min_duration_ns` must not be

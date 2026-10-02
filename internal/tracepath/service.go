@@ -278,6 +278,10 @@ type TraceFilter struct {
 	// Complete and Valid filter on the current reassembly result; nil = unset.
 	Complete *bool
 	Valid    *bool
+	// ServicePath keeps traces that contain this exact ordered chain of
+	// services, where every adjacent pair is a direct parent/child link. Empty
+	// means the filter is unset.
+	ServicePath []string
 }
 
 // TraceFilterFromQuery parses and validates every documented GET /traces
@@ -348,7 +352,44 @@ func TraceFilterFromQuery(query url.Values) (*TraceFilter, error) {
 		}
 		filter.Valid = &value
 	}
+	if values, present := query["service_path"]; present {
+		path, err := parseServicePath(values)
+		if err != nil {
+			return nil, err
+		}
+		filter.ServicePath = path
+	}
 	return filter, nil
+}
+
+// maxServicePathLength bounds the number of services one service_path chain may
+// name. Each name follows the same length rule as a span's service field.
+const maxServicePathLength = 32
+
+// parseServicePath validates the repeated service_path parameter. The names are
+// kept verbatim because matching is an exact byte comparison; only the
+// structural rules are checked here.
+func parseServicePath(values []string) ([]string, error) {
+	if len(values) < 2 {
+		return nil, ValidationError("service_path must name at least 2 services")
+	}
+	if len(values) > maxServicePathLength {
+		return nil, ValidationError("service_path must name at most %d services", maxServicePathLength)
+	}
+	path := make([]string, len(values))
+	for index, name := range values {
+		if strings.TrimSpace(name) == "" {
+			return nil, ValidationError("service_path names must not be empty")
+		}
+		if len(name) > maxTextLength {
+			return nil, ValidationError("service_path names must be at most %d characters", maxTextLength)
+		}
+		if index > 0 && path[index-1] == name {
+			return nil, ValidationError("adjacent service_path names must differ")
+		}
+		path[index] = name
+	}
+	return path, nil
 }
 
 // parseDurationBound accepts a decimal non-negative integer with no sign,
@@ -421,6 +462,9 @@ func (f *TraceFilter) matches(trace *Trace) bool {
 			}
 		}
 	}
+	if len(f.ServicePath) != 0 && !traceHasServicePath(trace, f.ServicePath) {
+		return false
+	}
 	switch f.Status {
 	case "error":
 		if trace.ErrorSpans == 0 {
@@ -464,6 +508,39 @@ func (f *TraceFilter) matches(trace *Trace) bool {
 		return false
 	}
 	return true
+}
+
+// traceHasServicePath reports whether the reassembled tree contains the
+// ordered service chain: a span whose service is path[0], with a direct child
+// whose service is path[1], and so on. The chain may start at any span, every
+// hop must be a direct parent/child link, and non-adjacent services may
+// repeat. Only the stored parent links are read; the trace itself is never
+// modified.
+func traceHasServicePath(trace *Trace, path []string) bool {
+	children := map[string][]*TraceNode{}
+	for _, node := range trace.Spans {
+		if node.ParentID != nil {
+			children[*node.ParentID] = append(children[*node.ParentID], node)
+		}
+	}
+	var walk func(node *TraceNode, depth int) bool
+	walk = func(node *TraceNode, depth int) bool {
+		if depth == len(path) {
+			return true
+		}
+		for _, child := range children[node.SpanID] {
+			if child.Service == path[depth] && walk(child, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, node := range trace.Spans {
+		if node.Service == path[0] && walk(node, 1) {
+			return true
+		}
+	}
+	return false
 }
 
 // ListTraces summarises every stored trace with at least one span.
