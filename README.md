@@ -18,6 +18,8 @@ The release deliberately supports a compact public contract:
 - everything else is validated when the trace is reassembled, and reported as
   violations instead of guessed or silently dropped;
 - the sum of `self_time_ns` along the critical path is the root duration;
+- spans can also be ingested in atomic batches of up to 1000, applied in order
+  and either stored together or not at all;
 - duplicate ingestion with the same `Idempotency-Key` returns the first result.
 
 ## Requirements
@@ -229,6 +231,58 @@ Ingestion is refused with HTTP 409 when the span contradicts the stored spans:
 - its parent is in another trace;
 - a span with that id already exists in the trace;
 - its interval is not contained in a parent that is already stored.
+
+### Ingest a batch of spans
+
+```http
+POST /spans/batch
+Idempotency-Key: batch-1
+Content-Type: application/json
+
+{"spans": [
+  {"trace_id": "t-1", "span_id": "s-db", "parent_id": "s-root", "service": "db",
+   "operation": "select", "kind": "client", "start_time": "2024-06-01T00:00:00.000000350Z",
+   "duration_ns": 600, "status": "ok", "attributes": {}},
+  {"trace_id": "t-1", "span_id": "s-root", "parent_id": null, "service": "gateway",
+   "operation": "GET /checkout", "kind": "server", "start_time": "2024-06-01T00:00:00Z",
+   "duration_ns": 1000, "status": "ok", "attributes": {}, "span_count": 6}
+]}
+```
+
+The body is exactly one field, `spans`, holding 1–1000 spans that may belong to
+different traces and may arrive root, children and siblings in any order. Each
+element follows the single-span rules above, and the batch is applied in array
+order as if the spans had been posted one by one.
+
+The batch is atomic: the first span that fails validation or conflicts with the
+stored spans or with an earlier span of the same batch aborts everything, only
+that first problem is reported (400 `validation_error` for field and structure
+problems, 409 `conflict` for identity, duplicate and time conflicts), no span of
+the batch is stored and the `Idempotency-Key` stays unused. A full success
+answers HTTP 201 with one entry per span, in request order, where `complete`,
+`valid` and `violations` snapshot the reassembly of that span's trace right
+after the span landed:
+
+```json
+{
+  "accepted": [
+    {"trace_id": "t-1", "span_id": "s-db", "accepted": true,
+     "complete": false, "valid": false, "violations": [
+       {"code": "no_root_span", "trace_id": "t-1", "span_id": "", "message": "..."},
+       {"code": "orphan_span", "trace_id": "t-1", "span_id": "s-db", "message": "..."}]},
+    {"trace_id": "t-1", "span_id": "s-root", "accepted": true,
+     "complete": false, "valid": true, "violations": []}
+  ],
+  "count": 2
+}
+```
+
+Replaying the request with the same `Idempotency-Key` and a byte-identical body
+returns the stored first response without writing again; the same key with a
+different body, or a key already used by another operation, is a `conflict`
+(409). Spans stored by a batch take part in reassembly, self time, the critical
+path, error propagation, the service graph and filtering exactly like
+individually ingested spans, and survive a restart.
 
 ### Read a trace
 

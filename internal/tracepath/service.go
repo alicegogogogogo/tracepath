@@ -1,6 +1,9 @@
 package tracepath
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"net/url"
 	"sort"
 	"strconv"
@@ -31,17 +34,26 @@ func (s *Service) now() string {
 	return s.clock().UTC().Format(idLayout)
 }
 
+// validateIdempotencyKey enforces the presence and length rules every
+// idempotent operation shares.
+func validateIdempotencyKey(key string) error {
+	if key == "" {
+		return ValidationError("Idempotency-Key header is required")
+	}
+	if len(key) > 200 {
+		return ValidationError("Idempotency-Key must be at most 200 characters")
+	}
+	return nil
+}
+
 // runIdempotent executes action at most once per key. The first response is
 // re-rendered from committed state for every later request that carries the
 // same key and the same resource identity, so a replay is byte-identical by
 // construction. Reusing a key for another operation, or for another resource,
 // is a conflict.
 func (s *Service) runIdempotent(key string, operation string, identity string, action func(state *State) (any, error)) (any, error) {
-	if key == "" {
-		return nil, ValidationError("Idempotency-Key header is required")
-	}
-	if len(key) > 200 {
-		return nil, ValidationError("Idempotency-Key must be at most 200 characters")
+	if err := validateIdempotencyKey(key); err != nil {
+		return nil, err
 	}
 	var response any
 	err := s.store.Update(func(state *State) error {
@@ -132,23 +144,83 @@ func renderSpan(state *State, traceID string, spanID string) (any, error) {
 	return response, nil
 }
 
+// decodeSpanInput strictly decodes one span document and runs every check that
+// does not need the stored state. It returns the parsed start instant and the
+// trimmed identifiers, exactly as single-span ingestion uses them.
+func decodeSpanInput(body []byte) (*SpanInput, time.Time, string, string, error) {
+	var input SpanInput
+	if err := decodeObject(body, &input); err != nil {
+		return nil, time.Time{}, "", "", err
+	}
+	start, err := validateSpanInput(&input)
+	if err != nil {
+		return nil, time.Time{}, "", "", err
+	}
+	spanID, err := validateIdentifier(input.SpanID, "span_id")
+	if err != nil {
+		return nil, time.Time{}, "", "", err
+	}
+	traceID, err := validateIdentifier(input.TraceID, "trace_id")
+	if err != nil {
+		return nil, time.Time{}, "", "", err
+	}
+	return &input, start, spanID, traceID, nil
+}
+
+// applySpan stores one validated span in state. Every check that needs the
+// other spans (parent existence across traces, duplicates, trace id agreement,
+// time containment) runs here against the state the caller passes, so a batch
+// sees the spans it has already applied exactly like sequential single-span
+// ingestion would.
+func applySpan(state *State, input *SpanInput, start time.Time, spanID string, traceID string) error {
+	spans, found := state.Spans[traceID]
+	if !found {
+		if parentID := input.ParentID; parentID != nil {
+			if _, elsewhere := findSpan(state, *parentID); elsewhere != nil {
+				return ConflictError("span %s belongs to trace %s but its parent %s belongs to trace %s",
+					spanID, traceID, *parentID, *elsewhere)
+			}
+		}
+		spans = map[string]*SpanInput{}
+		state.Spans[traceID] = spans
+	}
+	if _, duplicate := spans[spanID]; duplicate {
+		return ConflictError("span %s already exists in trace %s", spanID, traceID)
+	}
+	resolved, err := lineOf(spans, input)
+	if err != nil {
+		return err
+	}
+	if resolved != traceID {
+		return ConflictError("span %s belongs to trace %s but its parent chain resolves to trace %s",
+			spanID, traceID, resolved)
+	}
+	if input.ParentID != nil {
+		parent, found := spans[*input.ParentID]
+		if found {
+			parentStart, _ := parseTime(parent.StartTime, "start_time")
+			parentEnd := parentStart.Add(time.Duration(parent.DurationNS))
+			end := start.Add(time.Duration(input.DurationNS))
+			if start.Before(parentStart) || end.After(parentEnd) {
+				return ConflictError("span %s runs from %s to %s which is not contained in parent %s from %s to %s",
+					spanID, formatTime(start), formatTime(end), parent.SpanID, parent.StartTime, formatTime(parentEnd))
+			}
+		}
+	}
+	clone := *input
+	clone.Attributes = map[string]string{}
+	for attribute, value := range input.Attributes {
+		clone.Attributes[attribute] = value
+	}
+	spans[spanID] = &clone
+	return nil
+}
+
 // IngestSpan validates and stores one span. Every check that needs the other
 // spans of the trace (parent existence, trace id agreement, time containment)
 // runs against the committed state under the store lock.
 func (s *Service) IngestSpan(body []byte, key string) (any, error) {
-	var input SpanInput
-	if err := decodeObject(body, &input); err != nil {
-		return nil, err
-	}
-	start, err := validateSpanInput(&input)
-	if err != nil {
-		return nil, err
-	}
-	spanID, err := validateIdentifier(input.SpanID, "span_id")
-	if err != nil {
-		return nil, err
-	}
-	traceID, err := validateIdentifier(input.TraceID, "trace_id")
+	input, start, spanID, traceID, err := decodeSpanInput(body)
 	if err != nil {
 		return nil, err
 	}
@@ -156,53 +228,113 @@ func (s *Service) IngestSpan(body []byte, key string) (any, error) {
 	identity := traceID + "/" + spanID
 
 	if _, err := s.runIdempotent(key, operation, identity, func(state *State) (any, error) {
-		spans, found := state.Spans[traceID]
-		if !found {
-			if parentID := input.ParentID; parentID != nil {
-				if _, elsewhere := findSpan(state, *parentID); elsewhere != nil {
-					return nil, ConflictError("span %s belongs to trace %s but its parent %s belongs to trace %s",
-						spanID, traceID, *parentID, *elsewhere)
-				}
-			}
-			spans = map[string]*SpanInput{}
-			state.Spans[traceID] = spans
-		}
-		if _, duplicate := spans[spanID]; duplicate {
-			return nil, ConflictError("span %s already exists in trace %s", spanID, traceID)
-		}
-		resolved, err := lineOf(spans, &input)
-		if err != nil {
-			return nil, err
-		}
-		if resolved != traceID {
-			return nil, ConflictError("span %s belongs to trace %s but its parent chain resolves to trace %s",
-				spanID, traceID, resolved)
-		}
-		if input.ParentID != nil {
-			parent, found := spans[*input.ParentID]
-			if found {
-				parentStart, _ := parseTime(parent.StartTime, "start_time")
-				parentEnd := parentStart.Add(time.Duration(parent.DurationNS))
-				end := start.Add(time.Duration(input.DurationNS))
-				if start.Before(parentStart) || end.After(parentEnd) {
-					return nil, ConflictError("span %s runs from %s to %s which is not contained in parent %s from %s to %s",
-						spanID, formatTime(start), formatTime(end), parent.SpanID, parent.StartTime, formatTime(parentEnd))
-				}
-			}
-		}
-		clone := input
-		clone.Attributes = map[string]string{}
-		for attribute, value := range input.Attributes {
-			clone.Attributes[attribute] = value
-		}
-		spans[spanID] = &clone
-		return nil, nil
+		return nil, applySpan(state, input, start, spanID, traceID)
 	}); err != nil {
 		return nil, err
 	}
 	return s.store.View(func(state *State) (any, error) {
 		return renderSpan(state, traceID, spanID)
 	})
+}
+
+// batchItem is one entry of the accepted array of a batch response. Complete,
+// Valid and Violations snapshot the reassembly of the item's trace as it was
+// right after that span landed.
+type batchItem struct {
+	TraceID    string       `json:"trace_id"`
+	SpanID     string       `json:"span_id"`
+	Accepted   bool         `json:"accepted"`
+	Complete   bool         `json:"complete"`
+	Valid      bool         `json:"valid"`
+	Violations []Validation `json:"violations"`
+}
+
+// batchResponse is the body of a successful POST /spans/batch.
+type batchResponse struct {
+	Accepted []*batchItem `json:"accepted"`
+	Count    int          `json:"count"`
+}
+
+// batchEnvelope is the request body of POST /spans/batch: nothing but the
+// spans array. Each element stays raw so the spans are decoded and checked one
+// by one in request order.
+type batchEnvelope struct {
+	Spans []json.RawMessage `json:"spans"`
+}
+
+// IngestSpanBatch validates and stores a whole batch atomically. The spans are
+// applied in request order with exactly the rules of single-span ingestion; the
+// first failure aborts the batch, nothing is committed and the idempotency key
+// stays unused. A replay with the same key and a byte-identical body returns
+// the stored first response, because the per-item reassembly snapshots cannot
+// be re-rendered once later writes have changed the traces.
+func (s *Service) IngestSpanBatch(body []byte, key string) (any, error) {
+	if err := validateIdempotencyKey(key); err != nil {
+		return nil, err
+	}
+	var envelope batchEnvelope
+	if err := decodeObject(body, &envelope); err != nil {
+		return nil, err
+	}
+	if len(envelope.Spans) == 0 {
+		return nil, ValidationError("spans must contain at least 1 span")
+	}
+	if len(envelope.Spans) > maxBatchSpans {
+		return nil, ValidationError("spans must contain at most %d spans", maxBatchSpans)
+	}
+	operation := "ingest-span-batch"
+	identity := fmt.Sprintf("batch:%x", sha256.Sum256(body))
+
+	var response any
+	err := s.store.Update(func(state *State) error {
+		if record, found := state.Idempotency[key]; found {
+			if record.Operation != operation {
+				return ConflictError("idempotency key was already used for another operation")
+			}
+			if record.Identity != identity {
+				return ConflictError("idempotency key was already used for a different batch")
+			}
+			response = record.Response
+			return nil
+		}
+		result := &batchResponse{Accepted: []*batchItem{}}
+		for _, raw := range envelope.Spans {
+			input, start, spanID, traceID, err := decodeSpanInput(raw)
+			if err != nil {
+				return err
+			}
+			if err := applySpan(state, input, start, spanID, traceID); err != nil {
+				return err
+			}
+			trace := assembleTrace(traceID, state.Spans[traceID])
+			result.Accepted = append(result.Accepted, &batchItem{
+				TraceID:    traceID,
+				SpanID:     spanID,
+				Accepted:   true,
+				Complete:   trace.Complete,
+				Valid:      trace.Valid,
+				Violations: publicViolations(trace.Violations),
+			})
+		}
+		result.Count = len(result.Accepted)
+		snapshot, err := json.Marshal(result)
+		if err != nil {
+			return InternalError("batch response could not be serialised: %s", err)
+		}
+		state.Idempotency[key] = &IdempotencyRecord{
+			Key:       key,
+			Operation: operation,
+			Identity:  identity,
+			CreatedAt: s.now(),
+			Response:  snapshot,
+		}
+		response = result
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 // findSpan locates a span id in any trace and returns its trace id.

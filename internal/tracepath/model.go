@@ -24,6 +24,8 @@ const (
 	maxAttributeValue   = 512
 	maxSpanCount        = 100000
 	maxBodyBytes        = 1 << 20
+	// maxBatchSpans bounds the number of spans one POST /spans/batch carries.
+	maxBatchSpans = 1000
 )
 
 // spanKinds is the closed set of span kinds.
@@ -62,6 +64,11 @@ type IdempotencyRecord struct {
 	Operation string `json:"operation"`
 	Identity  string `json:"identity"`
 	CreatedAt string `json:"created_at"`
+	// Response holds the stored response of a batch ingestion. A batch response
+	// reports the reassembly state of every trace as it was right after each
+	// span landed, which later writes change, so a replay cannot re-render it
+	// from state and returns this snapshot instead. Empty for single spans.
+	Response json.RawMessage `json:"response,omitempty"`
 }
 
 // Violation is one structural error found while assembling a trace.
