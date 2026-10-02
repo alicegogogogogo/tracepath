@@ -464,6 +464,37 @@ a `status` other than `ok`/`error`, an empty `operation`, a `complete` /
 two or more than 32 names, an empty or over-long name, or two equal neighbours
 answers HTTP 400 with code `validation_error`.
 
+### Retention
+
+```http
+POST /traces/retention
+Content-Type: application/json
+
+{"before": "2024-06-02T00:00:00Z"}
+```
+
+```json
+{"before": "2024-06-02T00:00:00Z", "deleted_traces": 3, "deleted_spans": 11,
+ "retained_traces": 5, "retained_spans": 23}
+```
+
+Deletes every trace whose root start time is strictly earlier than `before`,
+together with all of its spans, and answers 200 with the cut-off echoed in UTC
+and the four non-negative counts of deleted and retained traces and spans. A
+trace whose root starts exactly at `before` is kept, and a trace without a root
+span is always kept because its start time is unknowable. The comparison uses
+nanosecond precision.
+
+The body must be a JSON object with `before` as its only field, an RFC3339
+instant; any other content type, shape, value or extra field answers HTTP 400
+with code `validation_error`. The operation takes no `Idempotency-Key`: it is a
+pure function of the committed state, so the same request on the same state
+always produces the same result. The deletion is one atomic commit — a failed
+persist answers HTTP 500 with code `internal_error` and leaves the state
+untouched — and it is persisted, so deleted traces stay gone across a restart.
+Every read endpoint (`GET /traces`, `GET /traces/{trace_id}`, critical path,
+service graph) only ever sees the retained data, with its contract unchanged.
+
 ## Error propagation
 
 Each node of a trace carries four derived fields:

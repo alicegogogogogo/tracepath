@@ -337,6 +337,67 @@ func (s *Service) IngestSpanBatch(body []byte, key string) (any, error) {
 	return response, nil
 }
 
+// retentionRequest is the body of POST /traces/retention: nothing but the
+// before instant.
+type retentionRequest struct {
+	Before string `json:"before"`
+}
+
+// RetentionResult is the body of a successful POST /traces/retention. Before
+// echoes the cut-off in the canonical UTC layout; the four counts partition
+// every stored trace and span into deleted and retained.
+type RetentionResult struct {
+	Before         string `json:"before"`
+	DeletedTraces  int    `json:"deleted_traces"`
+	DeletedSpans   int    `json:"deleted_spans"`
+	RetainedTraces int    `json:"retained_traces"`
+	RetainedSpans  int    `json:"retained_spans"`
+}
+
+// ApplyRetention deletes every trace whose root starts strictly before the
+// cut-off, together with all of its spans. A trace without a root span has no
+// knowable start time and is always retained, as is a trace whose root starts
+// exactly at the cut-off. The operation is not idempotency-keyed: it is a pure
+// function of the committed state, so repeating the same request on the same
+// state yields the same result, and the store's copy-on-write commit keeps a
+// failed persist from changing anything.
+func (s *Service) ApplyRetention(body []byte) (any, error) {
+	var request retentionRequest
+	if err := decodeObject(body, &request); err != nil {
+		return nil, err
+	}
+	before, err := parseTime(request.Before, "before")
+	if err != nil {
+		return nil, err
+	}
+	result := &RetentionResult{Before: formatTime(before)}
+	err = s.store.Update(func(state *State) error {
+		for _, traceID := range state.traceIDs() {
+			spans := state.Spans[traceID]
+			trace := assembleTrace(traceID, spans)
+			expired := false
+			if trace.Root != nil {
+				if rootStart, err := parseTime(trace.Root.StartTime, "start_time"); err == nil {
+					expired = rootStart.Before(before)
+				}
+			}
+			if expired {
+				result.DeletedTraces++
+				result.DeletedSpans += len(spans)
+				delete(state.Spans, traceID)
+			} else {
+				result.RetainedTraces++
+				result.RetainedSpans += len(spans)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // findSpan locates a span id in any trace and returns its trace id.
 func findSpan(state *State, spanID string) (*SpanInput, *string) {
 	for traceID, spans := range state.Spans {
