@@ -278,6 +278,10 @@ type TraceFilter struct {
 	// Complete and Valid filter on the current reassembly result; nil = unset.
 	Complete *bool
 	Valid    *bool
+	// ServicePath is an ordered chain of two or more service names. A trace
+	// matches when it holds spans s1..sn, each a direct child of the previous
+	// one, whose services equal the chain element by element. Nil means unset.
+	ServicePath []string
 }
 
 // TraceFilterFromQuery parses and validates every documented GET /traces
@@ -348,7 +352,41 @@ func TraceFilterFromQuery(query url.Values) (*TraceFilter, error) {
 		}
 		filter.Valid = &value
 	}
+	if query.Has("service_path") {
+		path, err := parseServicePath(query["service_path"])
+		if err != nil {
+			return nil, err
+		}
+		filter.ServicePath = path
+	}
 	return filter, nil
+}
+
+const (
+	// maxServicePathItems bounds the number of service_path elements and
+	// maxServicePathName the length of each name.
+	maxServicePathItems = 32
+	maxServicePathName  = 128
+)
+
+// parseServicePath validates the repeated service_path parameter. Names are
+// kept verbatim because matching is exact, so no whitespace is trimmed.
+func parseServicePath(names []string) ([]string, error) {
+	if len(names) < 2 || len(names) > maxServicePathItems {
+		return nil, ValidationError("service_path must contain between 2 and %d service names", maxServicePathItems)
+	}
+	for index, name := range names {
+		if name == "" {
+			return nil, ValidationError("service_path names must not be empty")
+		}
+		if len(name) > maxServicePathName {
+			return nil, ValidationError("service_path names must be at most %d characters", maxServicePathName)
+		}
+		if index > 0 && names[index-1] == name {
+			return nil, ValidationError("service_path names must differ from their neighbour")
+		}
+	}
+	return names, nil
 }
 
 // parseDurationBound accepts a decimal non-negative integer with no sign,
@@ -437,6 +475,9 @@ func (f *TraceFilter) matches(trace *Trace) bool {
 	if f.Valid != nil && trace.Valid != *f.Valid {
 		return false
 	}
+	if len(f.ServicePath) > 0 && !matchServicePath(trace.Spans, f.ServicePath) {
+		return false
+	}
 	if f.StartFrom != nil || f.StartTo != nil || f.MinDurationNS != nil || f.MaxDurationNS != nil {
 		// Every time and duration bound refers to the root. A trace without a
 		// root has neither a root instant nor a root duration, so any such
@@ -464,6 +505,34 @@ func (f *TraceFilter) matches(trace *Trace) bool {
 		return false
 	}
 	return true
+}
+
+// matchServicePath reports whether the reassembled span tree contains a chain
+// of direct parent/child spans whose services equal path element by element.
+// The chain may start at any span; only the stored parent/child links are
+// consulted, so an incomplete or invalid trace is judged on the spans it has.
+func matchServicePath(nodes []*TraceNode, path []string) bool {
+	for _, node := range nodes {
+		if matchServicePathFrom(node, path, 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchServicePathFrom(node *TraceNode, path []string, index int) bool {
+	if node.Service != path[index] {
+		return false
+	}
+	if index == len(path)-1 {
+		return true
+	}
+	for _, child := range node.Children {
+		if matchServicePathFrom(child, path, index+1) {
+			return true
+		}
+	}
+	return false
 }
 
 // ListTraces summarises every stored trace with at least one span.

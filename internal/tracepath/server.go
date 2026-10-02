@@ -49,7 +49,8 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 
 	case method == http.MethodGet && len(parts) == 1 && parts[0] == "traces":
 		if err := requireQuery(request, "service", "limit", "q", "operation", "status",
-			"start_from", "start_to", "min_duration_ns", "max_duration_ns", "complete", "valid"); err != nil {
+			"start_from", "start_to", "min_duration_ns", "max_duration_ns", "complete", "valid",
+			"service_path"); err != nil {
 			return 0, nil, err
 		}
 		filter, err := TraceFilterFromQuery(request.URL.Query())

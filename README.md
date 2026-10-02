@@ -362,6 +362,7 @@ GET /traces?service=db&limit=50
 GET /traces?q=checkout&status=error&complete=true&valid=true
 GET /traces?operation=select&start_from=2024-06-01T00:00:00Z&start_to=2024-06-02T00:00:00Z
 GET /traces?min_duration_ns=500&max_duration_ns=2000
+GET /traces?service_path=gateway&service_path=db&service_path=cache
 ```
 
 ```json
@@ -390,15 +391,24 @@ summary fields and the ordering are unchanged; a query with no matches returns
 | `max_duration_ns` | keeps traces whose root duration is less than or equal to this many nanoseconds (inclusive) |
 | `complete` | `true` or `false`; filters on the current reassembly result |
 | `valid` | `true` or `false`; filters on the current reassembly result |
+| `service_path` | repeatable; the occurrences in order name an ordered chain of 2–32 services, and a trace is kept when it holds spans `s1..sn`, each a direct child of the previous one, whose services equal the chain element by element |
+
+`service_path` names are matched verbatim (no trimming, case sensitive), each
+must be 1–128 characters, and neighbouring names must differ — a call inside
+one service is never a hop. The chain may start at any span, non-neighbouring
+names may repeat, and a trace that contains the chain more than once is still
+listed once. The check only reads the parent/child links of the stored spans,
+so it never changes `complete`, `valid`, `violations` or any summary field.
 
 `start_from` and `start_to` are compared at nanosecond precision. Duration
 bounds are decimal non-negative integers, and `min_duration_ns` must not be
 greater than `max_duration_ns`. A trace without a root span has no root start
 time or root duration, so any time or duration bound excludes it. An
 undocumented parameter, a non-RFC3339 time bound, a non-numeric duration bound,
-a `status` other than `ok`/`error`, an empty `operation`, or a `complete` /
-`valid` value other than `true`/`false` answers HTTP 400 with code
-`validation_error`.
+a `status` other than `ok`/`error`, an empty `operation`, a `complete` /
+`valid` value other than `true`/`false`, or a `service_path` with fewer than
+two or more than 32 names, an empty or over-long name, or two equal neighbours
+answers HTTP 400 with code `validation_error`.
 
 ## Error propagation
 
