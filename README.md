@@ -359,6 +359,9 @@ the sorted samples, which is deterministic and exact for small traces.
 ```http
 GET /traces
 GET /traces?service=db&limit=50
+GET /traces?q=checkout&status=error&complete=true&valid=true
+GET /traces?operation=select&start_from=2024-06-01T00:00:00Z&start_to=2024-06-02T00:00:00Z
+GET /traces?min_duration_ns=500&max_duration_ns=2000
 ```
 
 ```json
@@ -369,8 +372,33 @@ GET /traces?service=db&limit=50
 ```
 
 Traces are ordered by root start instant, newest first, then by trace id.
-`service` keeps only traces that contain that service, `limit` defaults to 100
-and must be between 1 and 400.
+`limit` defaults to 100 and must be between 1 and 400. Every other parameter is
+a filter; when several are given they combine with logical AND. Filtering runs
+after reassembly but before ordering and `limit`, so the response shape, the
+summary fields and the ordering are unchanged; a query with no matches returns
+`200` with `{"traces": []}`.
+
+| Parameter | Rule |
+| --- | --- |
+| `service` | keeps traces that contain that service (any span); whitespace is trimmed |
+| `q` | Unicode case-insensitive substring match against the trace id or any span's service or operation |
+| `operation` | keeps traces with at least one span whose operation equals it exactly; must not be empty |
+| `status` | `error` keeps traces that contain an error span; `ok` keeps traces whose spans are all `ok` |
+| `start_from` | keeps traces whose root start time is greater than or equal to this RFC3339 instant (inclusive) |
+| `start_to` | keeps traces whose root start time is strictly earlier than this RFC3339 instant (exclusive) |
+| `min_duration_ns` | keeps traces whose root duration is greater than or equal to this many nanoseconds (inclusive) |
+| `max_duration_ns` | keeps traces whose root duration is less than or equal to this many nanoseconds (inclusive) |
+| `complete` | `true` or `false`; filters on the current reassembly result |
+| `valid` | `true` or `false`; filters on the current reassembly result |
+
+`start_from` and `start_to` are compared at nanosecond precision. Duration
+bounds are decimal non-negative integers, and `min_duration_ns` must not be
+greater than `max_duration_ns`. A trace without a root span has no root start
+time or root duration, so any time or duration bound excludes it. An
+undocumented parameter, a non-RFC3339 time bound, a non-numeric duration bound,
+a `status` other than `ok`/`error`, an empty `operation`, or a `complete` /
+`valid` value other than `true`/`false` answers HTTP 400 with code
+`validation_error`.
 
 ## Error propagation
 

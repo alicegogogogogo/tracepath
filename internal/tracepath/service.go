@@ -1,7 +1,10 @@
 package tracepath
 
 import (
+	"net/url"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -253,26 +256,230 @@ func (s *Service) GetTrace(traceID string) (any, error) {
 	return trace, nil
 }
 
+// TraceFilter narrows GET /traces. Every condition that is set must hold; a
+// zero-valued filter keeps every trace. Time and duration fields are present as
+// pointers so that an unset bound never accidentally matches as zero.
+type TraceFilter struct {
+	// Query is matched as a Unicode case-insensitive substring of the trace id
+	// or of any span service or operation.
+	Query string
+	// Operation keeps traces that have at least one span with this exact op.
+	Operation string
+	// Service keeps traces that contain this service (the legacy semantics).
+	Service string
+	// Status is "", "error" (at least one error span) or "ok" (no error span).
+	Status string
+	// StartFrom is inclusive and StartTo is exclusive on the root start time.
+	StartFrom *time.Time
+	StartTo   *time.Time
+	// MinDurationNS and MaxDurationNS are both inclusive on the root duration.
+	MinDurationNS *int64
+	MaxDurationNS *int64
+	// Complete and Valid filter on the current reassembly result; nil = unset.
+	Complete *bool
+	Valid    *bool
+}
+
+// TraceFilterFromQuery parses and validates every documented GET /traces
+// parameter apart from limit, which the HTTP layer keeps. Unknown parameters
+// are rejected before this is called. All failures are validation errors.
+func TraceFilterFromQuery(query url.Values) (*TraceFilter, error) {
+	filter := &TraceFilter{
+		Query:   query.Get("q"),
+		Service: strings.TrimSpace(query.Get("service")),
+	}
+	if raw, present := query.Get("operation"), query.Has("operation"); present {
+		operation := strings.TrimSpace(raw)
+		if operation == "" {
+			return nil, ValidationError("operation must not be empty")
+		}
+		filter.Operation = operation
+	}
+	if query.Has("status") {
+		status := query.Get("status")
+		if status != "ok" && status != "error" {
+			return nil, ValidationError("status must be ok or error")
+		}
+		filter.Status = status
+	}
+	if raw, present := query.Get("start_from"), query.Has("start_from"); present {
+		instant, err := parseTime(raw, "start_from")
+		if err != nil {
+			return nil, err
+		}
+		filter.StartFrom = &instant
+	}
+	if raw, present := query.Get("start_to"), query.Has("start_to"); present {
+		instant, err := parseTime(raw, "start_to")
+		if err != nil {
+			return nil, err
+		}
+		filter.StartTo = &instant
+	}
+	if raw, present := query.Get("min_duration_ns"), query.Has("min_duration_ns"); present {
+		value, err := parseDurationBound(raw, "min_duration_ns")
+		if err != nil {
+			return nil, err
+		}
+		filter.MinDurationNS = &value
+	}
+	if raw, present := query.Get("max_duration_ns"), query.Has("max_duration_ns"); present {
+		value, err := parseDurationBound(raw, "max_duration_ns")
+		if err != nil {
+			return nil, err
+		}
+		filter.MaxDurationNS = &value
+	}
+	if filter.MinDurationNS != nil && filter.MaxDurationNS != nil &&
+		*filter.MinDurationNS > *filter.MaxDurationNS {
+		return nil, ValidationError("min_duration_ns must not be greater than max_duration_ns")
+	}
+	if raw, present := query.Get("complete"), query.Has("complete"); present {
+		value, err := parseBoolean(raw, "complete")
+		if err != nil {
+			return nil, err
+		}
+		filter.Complete = &value
+	}
+	if raw, present := query.Get("valid"), query.Has("valid"); present {
+		value, err := parseBoolean(raw, "valid")
+		if err != nil {
+			return nil, err
+		}
+		filter.Valid = &value
+	}
+	return filter, nil
+}
+
+// parseDurationBound accepts a decimal non-negative integer with no sign,
+// exponent or surrounding space.
+func parseDurationBound(raw string, field string) (int64, error) {
+	if raw == "" || strings.TrimSpace(raw) == "" {
+		return 0, ValidationError("%s must be a decimal non-negative integer", field)
+	}
+	for _, r := range raw {
+		if r < '0' || r > '9' {
+			return 0, ValidationError("%s must be a decimal non-negative integer", field)
+		}
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, ValidationError("%s must be a decimal non-negative integer", field)
+	}
+	return value, nil
+}
+
+// parseBoolean accepts exactly "true" or "false".
+func parseBoolean(raw string, field string) (bool, error) {
+	switch raw {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, ValidationError("%s must be true or false", field)
+	}
+}
+
+// matches reports whether one reassembled trace satisfies every set condition.
+func (f *TraceFilter) matches(trace *Trace) bool {
+	if f.Service != "" {
+		found := false
+		for _, node := range trace.Spans {
+			if node.Service == f.Service {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	if f.Operation != "" {
+		found := false
+		for _, node := range trace.Spans {
+			if node.Operation == f.Operation {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	if f.Query != "" {
+		if !containsFold(trace.TraceID, f.Query) {
+			found := false
+			for _, node := range trace.Spans {
+				if containsFold(node.Service, f.Query) || containsFold(node.Operation, f.Query) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+	}
+	switch f.Status {
+	case "error":
+		if trace.ErrorSpans == 0 {
+			return false
+		}
+	case "ok":
+		if trace.ErrorSpans != 0 {
+			return false
+		}
+	}
+	if f.Complete != nil && trace.Complete != *f.Complete {
+		return false
+	}
+	if f.Valid != nil && trace.Valid != *f.Valid {
+		return false
+	}
+	if f.StartFrom != nil || f.StartTo != nil || f.MinDurationNS != nil || f.MaxDurationNS != nil {
+		// Every time and duration bound refers to the root. A trace without a
+		// root has neither a root instant nor a root duration, so any such
+		// bound excludes it.
+		if trace.Root == nil {
+			return false
+		}
+	}
+	if f.StartFrom != nil || f.StartTo != nil {
+		rootStart, err := parseTime(trace.Root.StartTime, "start_time")
+		if err != nil {
+			return false
+		}
+		if f.StartFrom != nil && rootStart.Before(*f.StartFrom) {
+			return false
+		}
+		if f.StartTo != nil && !rootStart.Before(*f.StartTo) {
+			return false
+		}
+	}
+	if f.MinDurationNS != nil && trace.DurationNS < *f.MinDurationNS {
+		return false
+	}
+	if f.MaxDurationNS != nil && trace.DurationNS > *f.MaxDurationNS {
+		return false
+	}
+	return true
+}
+
 // ListTraces summarises every stored trace with at least one span.
-func (s *Service) ListTraces(service string, limit int) (any, error) {
+func (s *Service) ListTraces(filter *TraceFilter, limit int) (any, error) {
 	if limit < 1 || limit > 400 {
 		return nil, ValidationError("limit must be between 1 and 400")
+	}
+	if filter == nil {
+		filter = &TraceFilter{}
 	}
 	value, err := s.store.View(func(state *State) (any, error) {
 		summaries := []*TraceSummary{}
 		for _, traceID := range state.traceIDs() {
 			trace := assembleTrace(traceID, state.Spans[traceID])
-			if service != "" {
-				found := false
-				for _, node := range trace.Spans {
-					if node.Service == service {
-						found = true
-						break
-					}
-				}
-				if !found {
-					continue
-				}
+			if !filter.matches(trace) {
+				continue
 			}
 			summary := &TraceSummary{
 				TraceID:      trace.TraceID,
@@ -290,14 +497,13 @@ func (s *Service) ListTraces(service string, limit int) (any, error) {
 				summary.RootSpanID = &rootID
 				summary.RootService = &rootService
 				summary.StartTime = trace.Root.StartTime
+				summary.rootInstant, _ = parseTime(trace.Root.StartTime, "start_time")
 			}
 			summaries = append(summaries, summary)
 		}
 		sort.Slice(summaries, func(i, j int) bool {
-			left, _ := parseTime(summaries[i].StartTime, "start_time")
-			right, _ := parseTime(summaries[j].StartTime, "start_time")
-			if !left.Equal(right) {
-				return left.After(right)
+			if !summaries[i].rootInstant.Equal(summaries[j].rootInstant) {
+				return summaries[i].rootInstant.After(summaries[j].rootInstant)
 			}
 			return summaries[i].TraceID < summaries[j].TraceID
 		})

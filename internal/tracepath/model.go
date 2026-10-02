@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -253,6 +254,9 @@ type TraceSummary struct {
 	ErrorSpans   int     `json:"error_spans"`
 	Complete     bool    `json:"complete"`
 	Valid        bool    `json:"valid"`
+	// rootInstant is the parsed root start time used by the list ordering and by
+	// the start_from/start_to filters. It is not part of the JSON contract.
+	rootInstant time.Time
 }
 
 // decodeObject strictly decodes one JSON object. Unknown fields, trailing
@@ -287,6 +291,47 @@ func parseTime(value string, field string) (time.Time, error) {
 		return time.Time{}, ValidationError("%s must be an RFC3339 timestamp", field)
 	}
 	return instant.UTC(), nil
+}
+
+// containsFold reports whether text contains needle under Unicode simple case
+// folding, the substring analogue of strings.EqualFold. Runes are compared by
+// walking the complete SimpleFold equivalence cycle, the same rule
+// strings.EqualFold applies at one rune position.
+func containsFold(text string, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	haystack := []rune(text)
+	target := []rune(needle)
+	if len(target) > len(haystack) {
+		return false
+	}
+	for start := 0; start <= len(haystack)-len(target); start++ {
+		matches := true
+		for offset := range target {
+			if !runesEqualFold(haystack[start+offset], target[offset]) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
+// runesEqualFold reports whether two runes are simple-case-fold equivalent.
+func runesEqualFold(left rune, right rune) bool {
+	if left == right {
+		return true
+	}
+	for r := unicode.SimpleFold(left); r != left; r = unicode.SimpleFold(r) {
+		if r == right {
+			return true
+		}
+	}
+	return false
 }
 
 func validateIdentifier(value string, field string) (string, error) {

@@ -48,7 +48,12 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 		return http.StatusCreated, response, err
 
 	case method == http.MethodGet && len(parts) == 1 && parts[0] == "traces":
-		if err := requireQuery(request, "service", "limit"); err != nil {
+		if err := requireQuery(request, "service", "limit", "q", "operation", "status",
+			"start_from", "start_to", "min_duration_ns", "max_duration_ns", "complete", "valid"); err != nil {
+			return 0, nil, err
+		}
+		filter, err := TraceFilterFromQuery(request.URL.Query())
+		if err != nil {
 			return 0, nil, err
 		}
 		limit := 100
@@ -59,7 +64,7 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 			}
 			limit = parsed
 		}
-		response, err := s.service.ListTraces(strings.TrimSpace(request.URL.Query().Get("service")), limit)
+		response, err := s.service.ListTraces(filter, limit)
 		return http.StatusOK, response, err
 
 	case method == http.MethodGet && len(parts) == 2 && parts[0] == "traces":
