@@ -38,6 +38,21 @@ The process prints `TracePath listening on http://127.0.0.1:8080` after it has
 bound the port. `--database` is a JSON file that is rewritten atomically after
 every accepted span; omitting it uses `tracepath.db`.
 
+`--clock-skew-tolerance-ns` is a non-negative decimal int64 of nanoseconds
+(default `0`) for services whose clocks have a fixed offset. With tolerance
+`T`, every parent/child edge treats the parent interval as
+`[parent_start-T, parent_end+T)` during both ingestion and trace reassembly; a
+child touching either widened boundary counts as contained and the two ends
+are judged independently, so slack at one end cannot absorb an overrun at the
+other. It only relaxes parent/child interval containment: it never rewrites
+ingested `start_time`, `duration_ns` or `end_time`, never persists anything
+new, and does not relax sibling overlap, root-count, parent-chain,
+`span_count` or subtree-duration checks. A negative, non-numeric or
+out-of-int64 value terminates the process before the port is bound with
+`tracepath: clock-skew-tolerance-ns must be non-negative` (or the matching
+malformed-value message). The default of `0` keeps strict nanosecond-exact
+containment.
+
 ## Model
 
 ### Span

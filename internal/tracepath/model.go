@@ -467,17 +467,22 @@ func lineOf(spans map[string]*SpanInput, input *SpanInput) (string, error) {
 	return input.TraceID, nil
 }
 
+// treeBuilder carries the per-edge clock skew tolerance from the service into
+// trace reassembly. Every parent/child containment check treats the parent
+// interval as [parentStart-T, parentEnd+T); neither ingested values nor the
+// persisted state are ever rewritten.
 type treeBuilder struct {
 	spans      map[string]*SpanInput
 	children   map[string][]*SpanInput
 	roots      []*SpanInput
+	tolerance  time.Duration
 	violations []Violation
 }
 
 // assembleTrace rebuilds the span tree of one trace and derives every timing
 // value. Violations are collected, never fatal, so a caller always sees why a
 // trace is unusable.
-func assembleTrace(traceID string, spans map[string]*SpanInput) *Trace {
+func assembleTrace(traceID string, spans map[string]*SpanInput, tolerance time.Duration) *Trace {
 	trace := &Trace{
 		TraceID:    traceID,
 		SpanCount:  len(spans),
@@ -486,8 +491,9 @@ func assembleTrace(traceID string, spans map[string]*SpanInput) *Trace {
 		Spans:      []*TraceNode{},
 	}
 	builder := &treeBuilder{
-		spans:    spans,
-		children: map[string][]*SpanInput{},
+		spans:     spans,
+		children:  map[string][]*SpanInput{},
+		tolerance: tolerance,
 	}
 	ids := make([]string, 0, len(spans))
 	for id := range spans {
@@ -664,7 +670,12 @@ func (b *treeBuilder) buildNode(span *SpanInput, parentEnd time.Time, depth int)
 	for _, child := range children {
 		childStart, _ := parseTime(child.StartTime, "start_time")
 		childEnd := childStart.Add(time.Duration(child.DurationNS))
-		if childStart.Before(start) || childEnd.After(end) {
+		// The parent interval is widened by the clock skew tolerance on both
+		// ends. The two ends are judged independently: slack at one end cannot
+		// absorb an overrun at the other. A boundary hit counts as contained.
+		allowedStart := start.Add(-b.tolerance)
+		allowedEnd := end.Add(b.tolerance)
+		if childStart.Before(allowedStart) || childEnd.After(allowedEnd) {
 			b.violations = append(b.violations, Violation{
 				Code:    "time_not_contained",
 				TraceID: span.TraceID,
