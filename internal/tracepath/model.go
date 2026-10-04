@@ -472,12 +472,18 @@ type treeBuilder struct {
 	children   map[string][]*SpanInput
 	roots      []*SpanInput
 	violations []Violation
+	// clockSkewTolerance widens the parent interval for the time_not_contained
+	// check only: a child may start up to this many nanoseconds before its
+	// parent and end up to this many after it. Every other invariant (sibling
+	// overlap, subtree duration, root count) stays strict.
+	clockSkewTolerance time.Duration
 }
 
 // assembleTrace rebuilds the span tree of one trace and derives every timing
 // value. Violations are collected, never fatal, so a caller always sees why a
-// trace is unusable.
-func assembleTrace(traceID string, spans map[string]*SpanInput) *Trace {
+// trace is unusable. clockSkewToleranceNS relaxes only the parent/child time
+// containment check; 0 is the strict mode.
+func assembleTrace(traceID string, spans map[string]*SpanInput, clockSkewToleranceNS int64) *Trace {
 	trace := &Trace{
 		TraceID:    traceID,
 		SpanCount:  len(spans),
@@ -486,8 +492,9 @@ func assembleTrace(traceID string, spans map[string]*SpanInput) *Trace {
 		Spans:      []*TraceNode{},
 	}
 	builder := &treeBuilder{
-		spans:    spans,
-		children: map[string][]*SpanInput{},
+		spans:              spans,
+		children:           map[string][]*SpanInput{},
+		clockSkewTolerance: time.Duration(clockSkewToleranceNS),
 	}
 	ids := make([]string, 0, len(spans))
 	for id := range spans {
@@ -661,10 +668,16 @@ func (b *treeBuilder) buildNode(span *SpanInput, parentEnd time.Time, depth int)
 	})
 	previousEnd := start
 	previousID := ""
+	// The parent interval is widened by the configured clock skew tolerance on
+	// both sides, independently: a child may start at parent start - T and end
+	// at parent end + T, boundaries included. The tolerance never applies to
+	// the sibling overlap or subtree duration checks below.
+	toleratedStart := start.Add(-b.clockSkewTolerance)
+	toleratedEnd := end.Add(b.clockSkewTolerance)
 	for _, child := range children {
 		childStart, _ := parseTime(child.StartTime, "start_time")
 		childEnd := childStart.Add(time.Duration(child.DurationNS))
-		if childStart.Before(start) || childEnd.After(end) {
+		if childStart.Before(toleratedStart) || childEnd.After(toleratedEnd) {
 			b.violations = append(b.violations, Violation{
 				Code:    "time_not_contained",
 				TraceID: span.TraceID,

@@ -17,17 +17,33 @@ import (
 type Service struct {
 	store *Store
 	clock func() time.Time
+	// clockSkewToleranceNS relaxes only the parent/child time containment
+	// checks by this many nanoseconds on each side of the parent interval.
+	// Zero is the strict mode; stored spans are never rewritten either way.
+	clockSkewToleranceNS int64
 }
 
-// NewService wires a store and an injectable clock.
+// NewService wires a store and an injectable clock. It is the strict mode:
+// no clock skew between parent and child spans is tolerated.
 func NewService(store *Store, clock func() time.Time) (*Service, error) {
+	return NewServiceWithClockSkewTolerance(store, clock, 0)
+}
+
+// NewServiceWithClockSkewTolerance wires a store, an injectable clock and a
+// clock skew tolerance in nanoseconds. The tolerance must be non-negative; it
+// widens the accepted parent interval to [parent_start-T, parent_end+T) when
+// parent/child containment is judged, and changes nothing else.
+func NewServiceWithClockSkewTolerance(store *Store, clock func() time.Time, clockSkewToleranceNS int64) (*Service, error) {
 	if store == nil {
 		return nil, InternalError("service requires a store")
+	}
+	if clockSkewToleranceNS < 0 {
+		return nil, InternalError("clock-skew-tolerance-ns must be non-negative")
 	}
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{store: store, clock: clock}, nil
+	return &Service{store: store, clock: clock, clockSkewToleranceNS: clockSkewToleranceNS}, nil
 }
 
 func (s *Service) now() string {
@@ -107,7 +123,7 @@ type spanResponse struct {
 
 // renderSpan projects one stored span onto its public projection. The identity
 // of the projected span is returned as well.
-func renderSpan(state *State, traceID string, spanID string) (any, error) {
+func renderSpan(state *State, traceID string, spanID string, clockSkewToleranceNS int64) (any, error) {
 	spans, found := state.Spans[traceID]
 	if !found {
 		return nil, InternalError("trace %s disappeared during ingestion", traceID)
@@ -116,7 +132,7 @@ func renderSpan(state *State, traceID string, spanID string) (any, error) {
 	if !found {
 		return nil, InternalError("span %s of trace %s disappeared during ingestion", spanID, traceID)
 	}
-	trace := assembleTrace(traceID, spans)
+	trace := assembleTrace(traceID, spans, clockSkewToleranceNS)
 	declared := trace.SpanCount
 	if trace.RootSpanCount != 0 {
 		declared = trace.RootSpanCount
@@ -171,8 +187,9 @@ func decodeSpanInput(body []byte) (*SpanInput, time.Time, string, string, error)
 // other spans (parent existence across traces, duplicates, trace id agreement,
 // time containment) runs here against the state the caller passes, so a batch
 // sees the spans it has already applied exactly like sequential single-span
-// ingestion would.
-func applySpan(state *State, input *SpanInput, start time.Time, spanID string, traceID string) error {
+// ingestion would. clockSkewToleranceNS widens the parent interval by that
+// many nanoseconds on each side for the containment check only.
+func applySpan(state *State, input *SpanInput, start time.Time, spanID string, traceID string, clockSkewToleranceNS int64) error {
 	spans, found := state.Spans[traceID]
 	if !found {
 		if parentID := input.ParentID; parentID != nil {
@@ -201,7 +218,8 @@ func applySpan(state *State, input *SpanInput, start time.Time, spanID string, t
 			parentStart, _ := parseTime(parent.StartTime, "start_time")
 			parentEnd := parentStart.Add(time.Duration(parent.DurationNS))
 			end := start.Add(time.Duration(input.DurationNS))
-			if start.Before(parentStart) || end.After(parentEnd) {
+			tolerance := time.Duration(clockSkewToleranceNS)
+			if start.Before(parentStart.Add(-tolerance)) || end.After(parentEnd.Add(tolerance)) {
 				return ConflictError("span %s runs from %s to %s which is not contained in parent %s from %s to %s",
 					spanID, formatTime(start), formatTime(end), parent.SpanID, parent.StartTime, formatTime(parentEnd))
 			}
@@ -228,12 +246,12 @@ func (s *Service) IngestSpan(body []byte, key string) (any, error) {
 	identity := traceID + "/" + spanID
 
 	if _, err := s.runIdempotent(key, operation, identity, func(state *State) (any, error) {
-		return nil, applySpan(state, input, start, spanID, traceID)
+		return nil, applySpan(state, input, start, spanID, traceID, s.clockSkewToleranceNS)
 	}); err != nil {
 		return nil, err
 	}
 	return s.store.View(func(state *State) (any, error) {
-		return renderSpan(state, traceID, spanID)
+		return renderSpan(state, traceID, spanID, s.clockSkewToleranceNS)
 	})
 }
 
@@ -303,10 +321,10 @@ func (s *Service) IngestSpanBatch(body []byte, key string) (any, error) {
 			if err != nil {
 				return err
 			}
-			if err := applySpan(state, input, start, spanID, traceID); err != nil {
+			if err := applySpan(state, input, start, spanID, traceID, s.clockSkewToleranceNS); err != nil {
 				return err
 			}
-			trace := assembleTrace(traceID, state.Spans[traceID])
+			trace := assembleTrace(traceID, state.Spans[traceID], s.clockSkewToleranceNS)
 			result.Accepted = append(result.Accepted, &batchItem{
 				TraceID:    traceID,
 				SpanID:     spanID,
@@ -374,7 +392,7 @@ func (s *Service) ApplyRetention(body []byte) (any, error) {
 	err = s.store.Update(func(state *State) error {
 		for _, traceID := range state.traceIDs() {
 			spans := state.Spans[traceID]
-			trace := assembleTrace(traceID, spans)
+			trace := assembleTrace(traceID, spans, s.clockSkewToleranceNS)
 			expired := false
 			if trace.Root != nil {
 				if rootStart, err := parseTime(trace.Root.StartTime, "start_time"); err == nil {
@@ -429,7 +447,7 @@ func (s *Service) GetTrace(traceID string) (any, error) {
 		if !found {
 			return nil, NotFoundError("trace %s does not exist", traceID)
 		}
-		return assembleTrace(traceID, spans), nil
+		return assembleTrace(traceID, spans, s.clockSkewToleranceNS), nil
 	})
 	if err != nil {
 		return nil, err
@@ -739,7 +757,7 @@ func (s *Service) ListTraces(filter *TraceFilter, limit int) (any, error) {
 	value, err := s.store.View(func(state *State) (any, error) {
 		summaries := []*TraceSummary{}
 		for _, traceID := range state.traceIDs() {
-			trace := assembleTrace(traceID, state.Spans[traceID])
+			trace := assembleTrace(traceID, state.Spans[traceID], s.clockSkewToleranceNS)
 			if !filter.matches(trace) {
 				continue
 			}
@@ -789,7 +807,7 @@ func (s *Service) CriticalPath(traceID string) (any, error) {
 		if !found {
 			return nil, NotFoundError("trace %s does not exist", traceID)
 		}
-		return assembleTrace(traceID, spans), nil
+		return assembleTrace(traceID, spans, s.clockSkewToleranceNS), nil
 	})
 	if err != nil {
 		return nil, err
@@ -915,7 +933,7 @@ func (s *Service) ServiceGraph(traceID string) (any, error) {
 		edges := map[string]*ServiceEdge{}
 		graph.Stats.durations = []int64{}
 		for _, id := range ids {
-			trace := assembleTrace(id, state.Spans[id])
+			trace := assembleTrace(id, state.Spans[id], s.clockSkewToleranceNS)
 			usable := trace.Valid && trace.Complete && trace.Root != nil
 			if !usable {
 				if traceID != "" {
